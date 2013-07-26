@@ -1,429 +1,544 @@
-#include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
-#include <getopt.h>
-#include <sys/types.h>
-#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
+#include <sys/types.h>
 #include <fcntl.h>
-#include <linux/types.h>
+#include <stdio.h>
+#include <sys/mman.h>
 #include <errno.h>
-#include <signal.h>
 
-#ifdef OLD_V4L
-#include <linux/videodev.h>
+#include <linux/fs.h>
+#include <linux/kernel.h>
+#include <linux/videodev2.h>
+
+#include <jpeglib.h> 
+
+/*  Set these according to your capture device set-up */
+#define VID_DEVICE 	"/dev/video0" /* Device Name */
+#define VID_PIX_FLAGS 	V4L2_FMT_FLAG_ODDFIELD /* Video Output Format */
+#define VID_STD	  	"NTSC" /* Default Standard */
+#define VID_WIDTH  	320 /* Default Width */
+#define VID_HEIGHT 	240 /* Default Height */
+#define VID_STREAMING 	0 /* Streaming mode boolean */
+#define STREAMBUFS	4 /* Number of streaming buffer */
+#define DEFAULT_DEPTH	16
+#define DEFAULT_FPS	1
+/* Device Catpure Objects */
+typedef struct tag_vimage
+  {
+    struct v4l2_buffer vidbuf;
+    char *data;
+    int   length;
+  }
+VIMAGE;
+
+typedef struct
+{
+  int fd_video;
+  int width;
+  int height;
+  int depth;
+  int pixelformat;
+  VIMAGE vimage[STREAMBUFS];
+  struct v4l2_format fmt;
+  struct v4l2_requestbuffers req;
+}capture_device;
+
+/* Size Menu Objects */
+struct
+  {
+    int width, height;
+  }
+capturesize[] =
+{
+  { 160, 120 } ,
+  { 192, 144 } ,
+  { 320, 240 } ,
+  { 384, 288 } ,
+  { 640, 480 } ,
+  { 768, 576 } ,
+};
+ 
+/***************************/
+/* Device Catpure Routines */
+/***************************/
+
+int capture_fmt (int x_depth)
+{
+  int fbf = V4L2_PIX_FMT_RGB565;
+
+  if (x_depth == 15)
+    fbf = V4L2_PIX_FMT_RGB555;
+  else if (x_depth == 16)
+    fbf = V4L2_PIX_FMT_RGB565;
+  else if (x_depth == 24)
+    fbf = V4L2_PIX_FMT_BGR24;
+  else if (x_depth == 32)
+    fbf = V4L2_PIX_FMT_BGR32;
+  else
+    {
+      printf ("Unrecognized display depth. You may get an "
+	      "X Windows error.\n");
+    }
+    
+  return fbf;
+}
+
+
+int
+capture_perf (capture_device * pcapt_d)
+{
+  struct v4l2_performance perf;
+ 
+  if (ioctl (pcapt_d->fd_video, VIDIOC_G_PERF, &perf) != 0)
+    printf ("G_PERF returned error code %d\n", errno);
+  else
+    printf ("Captured %d frames and lost %d frames\n", perf.frames,
+	    perf.framesdropped);
+  return (perf.frames);
+}
+
+void
+capture_end (capture_device * pcapt_d)
+{
+  close (pcapt_d->fd_video);
+}
+
+void
+capture_std (capture_device * pcapt_d)
+{
+ int err;
+ 
+// v4l2_std NTSC to Standard
+ err = ioctl (pcapt_d->fd_video, VIDIOC_S_STD, 1);
+ if (err)
+   {
+     perror ("S_STD in capture_std");
+   }
+}
+
+void
+capture_size (capture_device * pcapt_d, int width, int height)
+{
+ int err;
+
+ pcapt_d->fmt.fmt.pix.width = width;
+ pcapt_d->fmt.fmt.pix.height = height;
+ err = ioctl (pcapt_d->fd_video, VIDIOC_S_FMT, &pcapt_d->fmt);
+ if (err)
+   {
+     perror ("S_FMT in capture_size");
+   }
+}
+
+void
+capture_stop (capture_device * pcapt_d, int streaming)
+{
+  int i, err;
+
+  if (pcapt_d->fd_video >= 0)
+    {
+      if (streaming)
+        {
+          i = V4L2_BUF_TYPE_CAPTURE;
+          err = ioctl (pcapt_d->fd_video, VIDIOC_STREAMOFF, &i);
+          for (i = 0; i < pcapt_d->req.count; ++i)
+  	    {
+	      if (pcapt_d->vimage[i].data)
+	        munmap (pcapt_d->vimage[i].data, pcapt_d->vimage[i].length);
+	      pcapt_d->vimage[i].data = NULL;
+	    }
+	}
+      else
+        {
+          if (pcapt_d->vimage[0].data)
+  	    free (pcapt_d->vimage[0].data);
+          pcapt_d->vimage[0].data = NULL;
+	}
+    }
+}
+
+int
+capture_start (capture_device * pcapt_d, int streaming)
+{
+  struct v4l2_standard std;
+  int i, err;
+
+  /* Get Video Standard */
+  err = ioctl (pcapt_d->fd_video, VIDIOC_G_STD, &std);
+  if (err)
+    perror ("G_STD in capture_start");
+
+  /* Get Video Format */
+  pcapt_d->fmt.type = V4L2_BUF_TYPE_CAPTURE;
+  err = ioctl (pcapt_d->fd_video, VIDIOC_G_FMT, &pcapt_d->fmt);
+  if (err)
+    perror ("G_FMT in capture_start");
+
+  pcapt_d->width = pcapt_d->fmt.fmt.pix.width;
+  pcapt_d->height = pcapt_d->fmt.fmt.pix.height;
+  pcapt_d->depth = pcapt_d->fmt.fmt.pix.depth;
+  pcapt_d->pixelformat = pcapt_d->fmt.fmt.pix.pixelformat;
+  
+ if (streaming)
+   {
+     /* Ask Video Device for Buffers */
+     pcapt_d->req.count = STREAMBUFS;
+     pcapt_d->req.type = V4L2_BUF_TYPE_CAPTURE;
+     err = ioctl (pcapt_d->fd_video, VIDIOC_REQBUFS, &pcapt_d->req);
+     if (err < 0 || pcapt_d->req.count < 1)
+       {
+         perror ("REQBUFS in capture _start\n");
+         return 0;
+       }
+    
+     /* Query each buffer and map it to the video device */
+     for (i = 0; i < pcapt_d->req.count; ++i)
+       {
+         struct v4l2_buffer *vidbuf = &pcapt_d->vimage[i].vidbuf;
+      
+         vidbuf->index = i;
+         vidbuf->type = V4L2_BUF_TYPE_CAPTURE;
+         err = ioctl (pcapt_d->fd_video, VIDIOC_QUERYBUF, vidbuf);
+         if (err < 0)
+   	   {
+	     perror ("QUERYBUF in capture_start");
+	     return 0;
+	   }
+	   
+         pcapt_d->vimage[i].length = 0;
+         pcapt_d->vimage[i].data = mmap (0, vidbuf->length, 
+	           PROT_READ|PROT_WRITE, MAP_SHARED,
+	           pcapt_d->fd_video, vidbuf->offset);
+         if ((int) pcapt_d->vimage[i].data == -1)
+	   {
+	     perror ("mmap() in capture_start");
+	     return 0;
+   	   }
+         pcapt_d->vimage[i].length = vidbuf->length; 
+
+	 err = ioctl (pcapt_d->fd_video, VIDIOC_QBUF, vidbuf);
+         if (err)
+           {
+	     perror ("QBUF in capture_start");
+	     return 0;
+           }
+       }
+       
+     /* Set video stream capture on */
+     err = ioctl (pcapt_d->fd_video, VIDIOC_STREAMON, &pcapt_d->vimage[0].vidbuf.type);
+     if (err)
+       perror ("STREAMON in capture_start");
+   }
+ else
+    {
+      /* Alloc one Buffer for one image */
+      int sizeimg = pcapt_d->width*pcapt_d->height*pcapt_d->depth/8;
+      
+      pcapt_d->req.count = 1;
+      pcapt_d->vimage[0].data = malloc (sizeimg);
+      if (pcapt_d->vimage[0].data == NULL)
+        {
+          printf ("malloc(%d) failed in capture_start\n", sizeimg);
+          return 0;
+        }
+    }
+
+  return 1;
+}
+
+
+int
+capture_init (capture_device * pcapt_d, char *my_device, 
+              unsigned int format, int width, int height, int depth)
+{
+  int err;
+  struct v4l2_capability cap;
+  struct v4l2_streamparm parm;
+  struct v4l2_standard std;
+
+  /* Open Video Device */
+  pcapt_d->fd_video = open (my_device, O_RDWR);
+  if (pcapt_d->fd_video < 0)
+    {
+      printf ("No video device \"%s\"\n", my_device);
+      return 0;
+    }
+
+  /* Querry Video Device Capabilities */
+  err = ioctl (pcapt_d->fd_video, VIDIOC_QUERYCAP, &cap);
+  if (err)
+    {
+      perror ("QUERYCAP in capture_init");
+      return 0;
+    }
+  if (cap.type != V4L2_TYPE_CAPTURE)
+    {
+      printf ("Not a capture device.\n");
+      return 0;
+    }
+  if (!(cap.flags & V4L2_FLAG_READ))
+    {
+      printf ("Device does not support the read() call.\n");
+    }
+  if (!(cap.flags & V4L2_FLAG_STREAMING))
+    {
+      printf ("Device does not support streaming capture.\n");
+    }
+
+
+  /* Set Video Parameters */
+  parm.type = V4L2_BUF_TYPE_CAPTURE;
+  err = ioctl (pcapt_d->fd_video, VIDIOC_G_PARM, &parm);
+  if (err)
+    perror ("G_PARM in capture_init");
+  
+  err = ioctl (pcapt_d->fd_video, VIDIOC_S_PARM, &parm);
+  if (err)
+    perror ("S_PARM in capture_init");
+    
+  /* Get Video Standard */
+  err = ioctl (pcapt_d->fd_video, VIDIOC_G_STD, &std);
+  if (err)
+    perror ("G_STD in capture_init");
+
+  /* Set Video Format */
+  pcapt_d->fmt.type = V4L2_BUF_TYPE_CAPTURE;
+  err = ioctl (pcapt_d->fd_video, VIDIOC_G_FMT, &pcapt_d->fmt);
+  if (err)
+    perror ("G_FMT in capture_init");
+
+  if (width)  
+    pcapt_d->fmt.fmt.pix.width = width;
+  else
+    pcapt_d->fmt.fmt.pix.width = VID_WIDTH;
+  if (height) 
+    pcapt_d->fmt.fmt.pix.height = height;
+  else
+    pcapt_d->fmt.fmt.pix.height = VID_HEIGHT;
+  if (depth) 
+    pcapt_d->fmt.fmt.pix.depth = depth;
+    
+  pcapt_d->fmt.fmt.pix.flags |= VID_PIX_FLAGS;
+#ifdef VID_PIXELFORMAT
+  pcapt_d->fmt.fmt.pix.pixelformat = VID_PIXELFORMAT;
 #else
-#include <libv4l1-videodev.h>
+  pcapt_d->fmt.fmt.pix.pixelformat = format;
 #endif
 
-#include <jpeglib.h>
-
-#define TIMEOUT_LEN 1000
-#define MAX_RGBA_IMAGE_SIZE ((704 * 576 * 3) + 256)
-#define VERSION "0.4.2"
-
-int dev;
-int bytes_per_rgb;
-
-struct video_window vid_win;
-struct video_capability vid_caps;
-struct video_picture vid_pic;
-struct video_tuner vid_tun;
-
-unsigned char *grab_data;
-int frozen, sequential = 0;
-unsigned int timeoutid;
-int jsmooth = 0, jopt = 0, jquality = 60;
-
-int export_jpeg(char *filename);
-void swap_rgb24(unsigned char *data);
-
-void _sighandler(int sig)
-{
-  switch (sig)
-  {
-  case SIGINT: /* ctrl+c */
-    fprintf(stderr, "Caught SIGINT - Cleaning \n");
-    exit(0);
-    break;
-  }
-}
-
-void usage()
-{
-  printf("picturegrabber: version %s iTuner Networks Corporation 2003\n", VERSION);
-  printf("Usage: picturegrabber [OPTION]\n");
-  printf("\t-c <num>  number of shots, -1=unlimited (option MANDATORY)\n");
-  printf("\t-i <sec>  interval between shots in seconds (default=4)\n");
-  printf("\t-d <dev>  device to open (default=/dev/video)\n");
-  printf("\t-D <dir>  output in this directory\n");
-  printf("\t-q        qcif 176x144 output (defaults to cif 352x288)\n");
-  printf("\t-s        use sequential filename numbering (out1,out2...)\n");
-  printf("\t-f <str>  filename prefix (used with -s, default=out)\n");
-  printf("\t-v        be verbose\n");
-  printf("\t-b        run in background as a daemon\n");
-  printf("\t-O        coding optimization  (default=no)\n");
-  printf("\t-Q <num>  quality factor [0-100] (default=60)\n");
-  printf("\t-S <num>  smoothing factor [0-100] (default=0)\n");
-  printf("\t-l        link last saved file as current.jpg \n");
-}
-int grab()
-{
-  ssize_t len = 0, size = 0;
-  errno = 0;
-
-  while ((len = read(dev, grab_data, MAX_RGBA_IMAGE_SIZE)) <= 0)
-  {
-    if (errno != 0 && errno != EINTR)
-    {
-      perror("Error read image\n");
-      free(grab_data);
-      return (0);
-    }
-  }
-  size += len;
+  pcapt_d->width = pcapt_d->fmt.fmt.pix.width;
+  pcapt_d->height = pcapt_d->fmt.fmt.pix.height;
+  pcapt_d->depth = pcapt_d->fmt.fmt.pix.depth;
+  pcapt_d->pixelformat = pcapt_d->fmt.fmt.pix.pixelformat;
+  
+  err = ioctl (pcapt_d->fd_video, VIDIOC_S_FMT, &pcapt_d->fmt);
+  if (err)
+    perror ("S_FMT in capture_init");
+  
   return (1);
 }
 
-int grab_mmap()
+int
+capture_read (capture_device * pcapt_d, int sz_img)
 {
-  grab_data = mmap(0, MAX_RGBA_IMAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, dev, 0);
-  printf("mmap().\n");
-  return (1);
-}
-
-void setbrightness(unsigned int value)
-{
-  vid_pic.brightness = (value)*256;
-  if (ioctl(dev, VIDIOCSPICT, &vid_pic) == -1)
-  {
-    perror("ioctl (VIDIOCSPICT)");
-    return;
-  }
-}
-
-void setcolor(unsigned int value)
-{
-  vid_pic.colour = (value)*256;
-  if (ioctl(dev, VIDIOCSPICT, &vid_pic) == -1)
-  {
-    perror("ioctl (VIDIOCSPICT)");
-    return;
-  }
-}
-
-void setcontrast(unsigned int value)
-{
-  vid_pic.contrast = (value)*256;
-  if (ioctl(dev, VIDIOCSPICT, &vid_pic) == -1)
-  {
-    perror("ioctl (VIDIOCSPICT)");
-    return;
-  }
-}
-
-void setsize_cif()
-{
-  vid_win.x = 0;
-  vid_win.y = 0;
-  vid_win.width = 352;
-  vid_win.height = 288;
-  if (ioctl(dev, VIDIOCSWIN, &vid_win) == -1)
-  {
-    perror("ioctl (VIDIOCSWIN)");
-    return;
-  }
-  return;
-}
-
-void setsize_qcif()
-{
-  vid_win.x = 88;
-  vid_win.y = 48;
-  vid_win.width = 176;
-  vid_win.height = 144;
-  if (ioctl(dev, VIDIOCSWIN, &vid_win) == -1)
-  {
-    perror("ioctl (VIDIOCSWIN)");
-    return;
-  }
-  return;
-}
-
-int main(int argc, char *argv[])
-{
-  unsigned long count = 0, j = 0;
-  int interval = 4, qcif = 0;
-  char filename[128];
-  char hostname[64];
-  char device[64];
-  char fprefix[64];
-  char startdir[128];
-  char ch;
-  int verbose = 0;
-  int bg = 0;
-  int dolink = 0;
-  int pid;
-
-  signal(SIGINT, _sighandler);
-
-  if ((grab_data = malloc(MAX_RGBA_IMAGE_SIZE)) == NULL)
-  {
-    perror("Error allocating memory for grabbing.\n");
-    return 0;
-  }
-
-  strcpy(device, "/dev/video");
-  strcpy(fprefix, "out");
-  startdir[0] = 0;
-
-  while ((ch = getopt(argc, argv, "qi:c:d:vsjOQ:S:f:D:bl")) != EOF)
-    switch ((char)ch)
+  int err;
+  
+  err = read (pcapt_d->fd_video, pcapt_d->vimage[0].data, sz_img);
+  if (err < 0)
     {
-    case 'S':
-      jsmooth = atoi(optarg);
-      break;
-    case 'O':
-      jopt = 1;
-      break;
-    case 'Q':
-      jquality = atoi(optarg);
-      break;
-    case 'b':
-      bg = 1;
-      break;
-    case 'q':
-      qcif = 1;
-      break;
-    case 's':
-      sequential = 1;
-      break;
-    case 'i':
-      interval = atoi(optarg);
-      break;
-    case 'f':
-      strcpy(fprefix, optarg);
-      break;
-    case 'D':
-      strcpy(startdir, optarg);
-      break;
-    case 'd':
-      strcpy(device, optarg);
-      break;
-    case 'c':
-      count = atol(optarg);
-      break;
-    case 'v':
-      verbose = 1;
-      break;
-    case 'l':
-      dolink = 1;
-      break;
-    case 'h':
-    default:
-      usage();
-      exit(4);
+      perror ("READ in capture_read");
+      return 0;
     }
+  
+  return 1;
+}
 
-  if (argc < 2 || count == 0)
-  {
-    usage();
-    exit(5);
-  }
+int
+capture_dq (capture_device * pcapt_d,
+	    struct v4l2_buffer *pbuf,
+	    int streaming)
+{
+  int err, n;
+  fd_set rdset;
+  struct timeval timeout;
 
-  if (jsmooth < 0 || jsmooth > 100)
-    jsmooth = 0;
-  if (jquality < 0 || jquality > 100)
-    jquality = 60;
+  if (streaming)
+    {
+      FD_ZERO (&rdset);
+      FD_SET (pcapt_d->fd_video, &rdset);
 
-  if (jopt < 0 || jopt > 100)
-    jopt = 1;
+      timeout.tv_sec = 1;
+      timeout.tv_usec = 0;
 
-  if (verbose)
-    printf("smooth:%d, quality:%d, optimize:%d\n", jsmooth, jquality, jopt);
-
-  if (gethostname(hostname, 64))
-  {
-    perror("gethostname");
-    exit(errno);
-  };
-
-  if (startdir[0] && chdir(startdir))
-  {
-    perror(startdir);
-    exit(errno);
-  }
-  dev = open(device, O_RDWR);
-  if (dev < 0)
-  {
-    perror(device);
-    exit(1);
-  }
-
-  vid_pic.depth = 0;
-
-  ioctl(dev, VIDIOCGCAP, &vid_caps);
-  ioctl(dev, VIDIOCGWIN, &vid_win);
-  ioctl(dev, VIDIOCGPICT, &vid_pic);
-
-  int ib = (vid_pic.brightness) / 256;
-  int ic = (vid_pic.contrast) / 256;
-  int iw = (vid_pic.colour) / 256;
-
-  printf("Brightness: %d, Contrast: %d, Colour: %d\n", ib, ic, iw);
-
-  /*  vid_pic.palette = VIDEO_PALETTE_RGB24;
-  bytes_per_rgb = 3;
-  vid_pic.depth = 24;*/
-
-  vid_pic.palette = VIDEO_PALETTE_RGB24;
-  bytes_per_rgb = 3;
-
-  /*  if(ioctl (dev, VIDIOCSPICT, &vid_pic)) {
-    perror("wrong palette/depth");
-    exit( 1 );
-  }
-*/
-  vid_win.x = 0;
-  vid_win.y = 0;
-  vid_win.width = 352;
-  vid_win.height = 288;
-
-  if (ioctl(dev, VIDIOCSWIN, &vid_win) == -1)
-  {
-    perror("ioctl (VIDIOCSWIN)");
-    exit(1);
-  }
-
-  if (qcif)
-    setsize_qcif();
+      n = select (pcapt_d->fd_video + 1, &rdset, NULL, NULL, &timeout);
+      if (n == -1)
+	fprintf (stderr, "select error.\n");
+      else if (n == 0)
+	fprintf (stderr, "select timeout\n");
+      else if (FD_ISSET (pcapt_d->fd_video, &rdset))
+	{
+	  pbuf->type = pcapt_d->vimage[0].vidbuf.type;
+	  err = ioctl (pcapt_d->fd_video, VIDIOC_DQBUF, pbuf);
+	  if (err)
+	    {
+	      perror ("DQBUF in capture_dq");
+	      return 0;
+	    }
+	  return 1;
+	}
+    }
   else
-    setsize_cif();
-
-  if (bg && (pid = fork()))
-  {
-    if (verbose)
-      printf("forking\n");
-    exit(0);
-  }
-
-  for (j = 0; j < count || count < 0; j++)
-  {
-    if (count < 0)
-      j = 0;
-    if (verbose)
     {
-      printf("iteration:%ld\n", j);
-      printf("count:%ld\n", count);
-      printf("sequential:%d\n", sequential);
-      printf("sleeping for: %d seconds\n", interval);
+      capture_read(pcapt_d, 1000000);
+      pbuf->index = 0;
+      return 1;
     }
-    sleep(interval);
-    if (verbose)
-      printf("grabbing...");
-
-    fflush(stdout);
-    grab();
-    swap_rgb24(grab_data);
-    //grab_mmap();
-    if (verbose)
-      printf("ok\n");
-    //strftime(time_buff,128,"%Y%j-%T",localtime(&thetime));
-    //sprintf(filename,"%s-spy-%s",hostname,time_buff);
-    sprintf(filename, "mediabox");
-    if (sequential)
-      sprintf(filename, "%s%02ld", fprefix, j);
-    strcat(filename, ".jpg");
-    if (verbose)
-      printf("Writting %s\n", filename);
-    errno = export_jpeg(filename);
-    if (dolink)
-    {
-      unlink("current.jpg");
-      if (symlink(filename, "current.jpg"))
-      {
-        perror("symlink:current.jpg");
-      }
-    }
-  }
-  free(grab_data);
-  //munmap (grab_data,MAX_RGBA_IMAGE_SIZE);
   return 0;
 }
 
-void swap_rgb24(unsigned char *data)
+void
+capture_q (capture_device * pcapt_d,
+	   struct v4l2_buffer *pbuf,
+	   int streaming)
 {
-  unsigned char c;
-  unsigned char *p = data;
-  int i = vid_win.width * vid_win.height;
-  while (--i)
-  {
-    c = p[0];
-    p[0] = p[2];
-    p[2] = c;
-    p += 3;
-  }
-}
+  int err;
 
-int export_jpeg(char *filename)
-{
-
-  char *fileout = filename;
-  unsigned char *img = grab_data;
-  int lx = vid_win.width;
-  int ly = vid_win.height;
-  //int lw=vid_pic.depth;
-  //int lw = 8;
-
-  FILE *fp;
-  unsigned char *line; // pointer to beggining of line
-  unsigned int linesize = lx * 3, i;
-  struct jpeg_compress_struct cinfo;
-  struct jpeg_error_mgr jerr;
-
-  if (!strncmp(fileout, "-", 1))
-  {
-    fp = stdout; // we dump the file to stdout
-  }
-  else
-  {
-    if ((fp = fopen(fileout, "w")) == NULL)
+  if (streaming)
     {
-      perror("fopen");
-      return -1;
+      err = ioctl (pcapt_d->fd_video, VIDIOC_QBUF, pbuf);
+      if (err)
+	perror ("QBUF in capture_q");
     }
-  }
-
-  cinfo.err = jpeg_std_error(&jerr);
-  jpeg_create_compress(&cinfo);
-  jpeg_stdio_dest(&cinfo, fp);
-  cinfo.image_width = lx;
-  cinfo.image_height = ly;
-  cinfo.smoothing_factor = jsmooth;
-  cinfo.optimize_coding = jopt;
-
-  cinfo.input_components = 3;
-  if (vid_pic.depth == 1)
-    cinfo.in_color_space = JCS_GRAYSCALE;
-  else
-    cinfo.in_color_space = JCS_RGB;
-
-  jpeg_set_defaults(&cinfo);
-  jpeg_set_quality(&cinfo, jquality, TRUE);
-  jpeg_start_compress(&cinfo, TRUE);
-
-  line = img;
-
-  for (i = 1; i <= ly; i++)
-  {
-    jpeg_write_scanlines(&cinfo, &line, 1);
-    line = img + (linesize * i);
-  }
-
-  jpeg_finish_compress(&(cinfo));
-  jpeg_destroy_compress(&(cinfo));
-  fclose(fp);
-  return (0);
 }
+
+
+
+void grabSetFps(int fd, int fps)
+{
+  struct v4l2_streamparm params;
+
+  printf("called v4l2_set_fps with fps=%d\n",fps);
+  params.type = V4L2_BUF_TYPE_CAPTURE;
+  ioctl(fd, VIDIOC_G_PARM, &params);
+  printf("time per frame is: %ld\n", params.parm.capture.timeperframe);
+  params.parm.capture.capturemode |= V4L2_CAP_TIMEPERFRAME;
+  params.parm.capture.timeperframe = 10000000 / fps;
+  if (fps == 30)
+    params.parm.capture.timeperframe = 333667;
+  printf("time per frame is: %ld\n", params.parm.capture.timeperframe);
+  ioctl(fd, VIDIOC_S_PARM, &params);
+  
+  params.parm.capture.timeperframe = 0;
+  ioctl(fd, VIDIOC_G_PARM, &params);
+  printf("time per frame is: %ld\n", params.parm.capture.timeperframe);  
+}
+
+/*****************************************/
+/* Export functions                      */
+/*****************************************/
+
+int export_jpeg (capture_device * pcapt_d,int count) {
+
+        char *fileout = (char *) malloc (50);
+	snprintf (fileout,50,"%s%s","mediabox",".jpg");
+	int lx=pcapt_d->width;
+	int ly=pcapt_d->height;
+	int jsmooth=60;
+	int jopt=40;
+	int jquality=90;
+	int k;
+	char *img = (char *) malloc (lx*ly*pcapt_d->depth*sizeof(char));
+	img = pcapt_d->vimage[0].data;
+	char t;
+
+	for (k = 0; k < 1000000; k += 3)
+	{
+			t = img[k];
+			img[k] = img[k + 2];
+			img[k + 2] = t;
+	}
+	
+	FILE *fp;
+	unsigned char *line;  // pointer to beggining of line
+	unsigned int linesize = lx * 3, i;
+	struct jpeg_compress_struct cinfo;
+        struct jpeg_error_mgr jerr;
+
+	if (!strncmp(fileout, "-", 1)) {
+		fp=stdout; // we dump the file to stdout
+	} else {
+		if ( (fp=fopen(fileout , "w")) == NULL) {
+        		perror ("fopen");
+			return -1;
+		}
+	}
+	
+	cinfo.err = jpeg_std_error(&jerr);
+	jpeg_create_compress(&cinfo);
+        jpeg_stdio_dest(&cinfo, fp);
+        cinfo.image_width = lx;
+        cinfo.image_height = ly;
+	cinfo.smoothing_factor = jsmooth;
+	cinfo.optimize_coding = jopt;
+
+	cinfo.input_components = 3;
+	if (pcapt_d->depth == 1)  cinfo.in_color_space = JCS_GRAYSCALE;
+	else cinfo.in_color_space = JCS_RGB;
+
+	jpeg_set_defaults(&cinfo);
+	jpeg_set_quality(&cinfo, jquality, TRUE);
+	jpeg_start_compress(&cinfo, TRUE);
+	
+	line=img;
+
+	for (i = 1; i <= ly; i++) {
+		jpeg_write_scanlines(&cinfo, &line, 1);
+		line=img + (linesize * i);
+		}
+	
+	jpeg_finish_compress(&(cinfo));
+	jpeg_destroy_compress(&(cinfo));
+	fclose (fp);
+	fprintf (stdout, "Done exporting to jpeg\n");
+	return (0);
+}
+
+int
+main (int argc, char *argv[])
+{
+  capture_device capt_d;
+
+  /* Video Parameters */
+  char my_device[64];
+  int format,i=0;
+
+  /*    Put in the device node name */
+  strcpy (my_device, VID_DEVICE);
+  
+  format = capture_fmt(DEFAULT_DEPTH);
+  capture_init (&capt_d, my_device, format, 0, 0, 0);
+  
+  grabSetFps(capt_d.fd_video, DEFAULT_FPS);
+
+  if (!capture_start (&capt_d, VID_STREAMING))
+    exit(1);
+    
+  printf ("Capturing %dx%dx%d \"%4.4s\" images\n",
+	  capt_d.width, capt_d.height, capt_d.depth,
+	  (char *) &(capt_d.pixelformat));
+  printf ("Images are %d bytes each\n", 
+          capt_d.width * capt_d.height * capt_d.depth / 8);
+
+    for (;;) {
+	struct v4l2_buffer tempbuf;
+	if (capture_dq (&capt_d, &tempbuf, VID_STREAMING)){
+	i++;
+	    export_jpeg (&capt_d,i);
+  	    capture_q (&capt_d, &tempbuf, VID_STREAMING);
+	}
+    }
+    return 0;
+}
+
